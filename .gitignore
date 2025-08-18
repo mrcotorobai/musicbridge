@@ -1,0 +1,10 @@
+/backend/node_modules
+/backend/.env
+.DS_Store
+/ios/Pods
+/ios/*.xcworkspace
+/ios/DerivedData
+/android/.gradle
+/android/app/build
+/android/local.properties
+.env
