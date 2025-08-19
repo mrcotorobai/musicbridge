@@ -1,0 +1,19 @@
+// imports + setup (express, cors, dotenv, etc.)
+const express = require('express');
+const app = express();
+
+// middleware here (app.use(...))
+
+// ✅ define routes BEFORE listen
+app.get('/', (_req, res) => {
+  res.json({ ok: true, service: 'musicbridge-mapper', routes: ['/map/song?url=...&country=us'] });
+});
+
+app.get('/health', (_req, res) => res.send('ok'));
+
+// ... your /map/song route here ...
+
+// 🚀 start the server AT THE BOTTOM
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Mapping service listening on port 3000');
+});
