@@ -19,7 +19,19 @@ const ITUNES_LOOKUP = 'https://itunes.apple.com/lookup';
 
 /* ---------------------- spotify auth ---------------------- */
 
+// In-memory cache for the Spotify token to avoid re-fetching on every request
+const spotifyTokenCache = {
+  token: null,
+  expires: 0, // Expiry time in milliseconds
+};
+
 async function getSpotifyToken() {
+  // If we have a valid token in the cache, return it immediately
+  if (spotifyTokenCache.token && Date.now() < spotifyTokenCache.expires) {
+    return spotifyTokenCache.token;
+  }
+
+  console.log('Requesting new Spotify token...');
   const id = process.env.SPOTIFY_CLIENT_ID;
   const secret = process.env.SPOTIFY_CLIENT_SECRET;
   if (!id || !secret) {
@@ -39,7 +51,13 @@ async function getSpotifyToken() {
     throw new Error(`Spotify token failed: ${resp.status} ${text}`);
   }
   const json = await resp.json();
-  return json.access_token;
+  
+  // Store the new token and calculate its expiry time
+  spotifyTokenCache.token = json.access_token;
+  // Set expiry to 5 minutes before it actually expires, as a safety margin
+  spotifyTokenCache.expires = Date.now() + (json.expires_in - 300) * 1000;
+  
+  return spotifyTokenCache.token;
 }
 
 /* ---------------------- url parsing ---------------------- */
@@ -58,23 +76,24 @@ function parseInputUrl(u) {
       if (parts[0] === 'album') {
         return { platform: 'spotify', kind: 'album', id: parts[1] || null, raw: url };
       }
+      // Added playlist support
+      if (parts[0] === 'playlist') {
+        return { platform: 'spotify', kind: 'playlist', id: parts[1] || null, raw: url };
+      }
       return { platform: 'spotify', kind: 'unknown', id: null, raw: url };
     }
 
     // Apple Music / iTunes
     if (host.includes('music.apple.com') || host.includes('itunes.apple.com')) {
-      // Song links: often album path with ?i=<trackId>
       const aTrackId = url.searchParams.get('i');
       if (aTrackId) return { platform: 'apple', kind: 'song', id: aTrackId, raw: url };
 
-      // Album links: /{country}/album/{slug}/{albumId}
       const albumIdx = parts.findIndex(p => p === 'album');
       if (albumIdx !== -1) {
-        const maybeId = parts[albumIdx + 2]; // slug then id
+        const maybeId = parts[albumIdx + 2];
         if (maybeId && /^\d+$/.test(maybeId)) {
           return { platform: 'apple', kind: 'album', id: maybeId, raw: url };
         }
-        // Sometimes path ends right after slug; try last numeric segment
         const last = parts[parts.length - 1];
         if (last && /^\d+$/.test(last)) {
           return { platform: 'apple', kind: 'album', id: last, raw: url };
@@ -89,7 +108,7 @@ function parseInputUrl(u) {
   }
 }
 
-/* ---------------------- spotify: tracks & albums ---------------------- */
+/* ---------------------- spotify: tracks, albums & playlists ---------------------- */
 
 async function getSpotifyTrack(trackId, token) {
   const resp = await fetch(`${SPOTIFY_API_BASE}/tracks/${encodeURIComponent(trackId)}`, {
@@ -112,6 +131,42 @@ async function getSpotifyAlbum(albumId, token) {
   }
   return resp.json();
 }
+
+async function getSpotifyPlaylist(playlistId, token) {
+  let allTracks = [];
+  let nextUrl = `${SPOTIFY_API_BASE}/playlists/${encodeURIComponent(playlistId)}?market=US`;
+
+  const playlistDetailsResp = await fetch(nextUrl, { headers: { Authorization: `Bearer ${token}` } });
+  if (!playlistDetailsResp.ok) {
+    const t = await playlistDetailsResp.text();
+    throw new Error(`Spotify playlist metadata fetch failed: ${playlistDetailsResp.status} ${t}`);
+  }
+  const playlistData = await playlistDetailsResp.json();
+  
+  // The first page of tracks is included in the main playlist response
+  allTracks.push(...playlistData.tracks.items);
+  nextUrl = playlistData.tracks.next;
+
+  // Fetch subsequent pages of tracks if they exist (pagination)
+  while (nextUrl) {
+    const resp = await fetch(nextUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (!resp.ok) {
+      console.error('Failed to fetch a subsequent page of tracks, returning what we have so far.');
+      break; // Exit loop on page failure
+    }
+    const pageData = await resp.json();
+    allTracks.push(...pageData.items);
+    nextUrl = pageData.next;
+  }
+  
+  return {
+    name: playlistData.name,
+    description: playlistData.description,
+    owner: playlistData.owner?.display_name,
+    tracks: allTracks.map(item => item.track).filter(Boolean) // Filter out any null tracks
+  };
+}
+
 
 async function searchSpotifyTrackByIsrc(isrc, token) {
   const q = `isrc:${isrc}`;
@@ -194,14 +249,13 @@ function normalizeItunesSong(item) {
     artists: [item.artistName],
     album: item.collectionName,
     isrc: item.isrc || null,
-    appleUrl: item.trackViewUrl || item.collectionViewUrl || null,
+    appleUrl: item.trackViewUrl || null,
     previewUrl: item.previewUrl || null,
   };
 }
 
 // albums
 async function itunesSearchAlbumByUpc(upc, country = 'us') {
-  // UPC search is an unofficial but commonly supported attribute (like isrcTerm)
   const url = `${ITUNES_SEARCH}?term=${encodeURIComponent(upc)}&entity=album&attribute=upcTerm&country=${encodeURIComponent(country)}&limit=5`;
   const resp = await fetch(url);
   if (!resp.ok) return null;
@@ -224,7 +278,7 @@ function normalizeItunesAlbum(item) {
   return {
     name: item.collectionName,
     artists: [item.artistName],
-    upc: item.upc || null, // often not present in iTunes JSON
+    upc: item.upc || null,
     appleUrl: item.collectionViewUrl || null,
     artwork: item.artworkUrl100 || null,
     collectionId: item.collectionId || null,
@@ -239,10 +293,11 @@ app.get('/', (_req, res) => {
     service: 'musicbridge-mapper',
     routes: [
       '/health',
-      '/map/song?url=<spotify_or_apple_song_link>&country=us',
-      '/r/song?url=<spotify_or_apple_song_link>&country=us',
-      '/map/album?url=<spotify_or_apple_album_link>&country=us',
-      '/r/album?url=<spotify_or_apple_album_link>&country=us'
+      '/map/song?url=<spotify_or_apple_song_link>',
+      '/r/song?url=<spotify_or_apple_song_link>',
+      '/map/album?url=<spotify_or_apple_album_link>',
+      '/r/album?url=<spotify_or_apple_album_link>',
+      '/map/playlist?url=<spotify_playlist_link>',
     ]
   });
 });
@@ -359,7 +414,6 @@ app.get('/map/album', async (req, res) => {
       const artist = lookup?.artistName || null;
 
       const token = await getSpotifyToken();
-      // iTunes lookup usually doesn’t expose UPC; rely on text search.
       let sp = null;
       if (name && artist) sp = await searchSpotifyAlbumByText(name, artist, token);
 
@@ -403,6 +457,79 @@ app.get('/r/album', async (req, res) => {
     return res.status(500).send('Internal error');
   }
 });
+
+/* -------- playlists: JSON mapper -------- */
+app.get('/map/playlist', async (req, res) => {
+  const { url, country = 'us' } = req.query;
+  if (!url) return res.status(400).json({ ok: false, error: 'Missing ?url=' });
+
+  const parsed = parseInputUrl(url);
+
+  console.log('--- Deeper Debugging ---');
+  console.log('Playlist ID:', parsed.id);
+  console.log('Playlist ID Length:', parsed.id?.length);
+  console.log('Encoded for URL:', parsed.id ?       encodeURIComponent(parsed.id) : 'null');
+  console.log('------------------------');
+
+  try {
+    if (parsed.platform === 'spotify' && parsed.kind === 'playlist' && parsed.id) {
+      const token = await getSpotifyToken();
+      const playlist = await getSpotifyPlaylist(parsed.id, token);
+
+      // Create a promise for each track to find its Apple Music match.
+      // Promise.all runs these searches in parallel for maximum speed.
+      const matchPromises = playlist.tracks.map(track => {
+        const name = track.name;
+        const artist = track.artists?.[0]?.name || '';
+        const isrc = track.external_ids?.isrc || null;
+        
+        const spotifyMeta = {
+          name,
+          artists: track.artists?.map(a => a.name) || [],
+          album: track.album?.name,
+          isrc
+        };
+        
+        return new Promise(async (resolve) => {
+          let appleMatch = null;
+          if (isrc) {
+            appleMatch = await itunesSearchSongByIsrc(isrc, country);
+          }
+          if (!appleMatch) {
+            appleMatch = await itunesSearchSongByText(name, artist, country);
+          }
+          // Resolve with both the original and the match (or null)
+          resolve({ spotify: spotifyMeta, apple: appleMatch });
+        });
+      });
+
+      // Wait for all the parallel searches to complete.
+      const results = await Promise.all(matchPromises);
+
+      return res.json({
+        ok: true,
+        direction: 'spotify→apple',
+        playlistInfo: {
+          name: playlist.name,
+          description: playlist.description,
+          owner: playlist.owner,
+        },
+        // The user only wants to see successful matches.
+        matches: results.filter(r => r.apple !== null),
+        trackCount: {
+          original: playlist.tracks.length,
+          matched: results.filter(r => r.apple !== null).length,
+        }
+      });
+    }
+
+    return res.status(400).json({ ok: false, error: 'Unsupported or invalid URL; only Spotify playlists supported on this endpoint.' });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 
 /* ---------------------- start server ---------------------- */
 
